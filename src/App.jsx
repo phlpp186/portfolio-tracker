@@ -167,6 +167,25 @@ function datesBetween(a, b) {
   return dates;
 }
 
+// Bucket a YYYY-MM-DD date string into a period key + human label
+function periodKey(dateStr, period) {
+  const d = new Date(dateStr);
+  if (period === "day")   return { key: dateStr, label: dateStr };
+  if (period === "week") {
+    const t = new Date(d);
+    const day = (t.getDay() + 6) % 7;          // Monday = 0
+    t.setDate(t.getDate() - day);
+    const k = t.toISOString().split("T")[0];
+    return { key: k, label: `Week of ${k}` };
+  }
+  if (period === "month") {
+    const k = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`;
+    return { key: k, label: d.toLocaleDateString("en-GB",{month:"long",year:"numeric"}) };
+  }
+  if (period === "year")  return { key: String(d.getFullYear()), label: String(d.getFullYear()) };
+  return { key: dateStr, label: dateStr };
+}
+
 // ─── UI PRIMITIVES ─────────────────────────────────────────────────────────
 const inputStyle={width:"100%",background:"#0D0F0E",border:"1px solid #2A2D2B",borderRadius:"2px",color:"#E8E0D0",fontSize:"14px",padding:"10px 12px",outline:"none",boxSizing:"border-box",fontFamily:"Georgia, serif"};
 const btnStyle={width:"100%",background:"#C8A97E",border:"none",borderRadius:"2px",color:"#0D0F0E",fontSize:"11px",letterSpacing:"3px",padding:"12px",cursor:"pointer",textTransform:"uppercase",fontWeight:"700",fontFamily:"Georgia, serif"};
@@ -249,6 +268,9 @@ export default function PortfolioTracker() {
   const [propertyForm,setPropertyForm]=useState({name:"",currentValue:"",note:""});
   const [commodityForm,setCommodityForm]=useState({name:"Gold",weight:"",unit:"oz",pricePerUnit:"",note:""});
   const [snapshotDate,setSnapshotDate]=useState(today());
+  const [incomeFilter,setIncomeFilter]=useState("all");      // all | dividend | p2p
+  const [incomePeriod,setIncomePeriod]=useState("month");    // none | day | week | month | year
+  const [incomeSource,setIncomeSource]=useState("all");      // all | <platform/ticker name>
 
   // ── Init Google OAuth ──────────────────────────────────────────────────
   useEffect(() => {
@@ -390,12 +412,22 @@ export default function PortfolioTracker() {
   const totalP2PInterest      = data.p2pInterest.reduce((s,i)=>s+Number(i.amount),0);
   const totalIncome           = totalDividends+totalP2PInterest;
 
-  const allocationData = [
+  const allocationRaw = [
     ...data.assets.map(a=>({name:a.ticker||a.name,value:a.shares*a.currentPrice})),
     ...data.p2pLoans.map(l=>({name:l.platform,value:Number(l.amount)})),
     ...data.realEstate.map(p=>({name:p.name,value:Number(p.currentValue)})),
     ...data.commodities.map(c=>({name:c.name,value:Number(c.weight)*Number(c.pricePerUnit)})),
   ].filter(a=>a.value>0);
+
+  // Merge entries that share a name (e.g. multiple Monefit vaults) into one slice
+  const allocationData = Object.values(
+    allocationRaw.reduce((acc, item) => {
+      if (!acc[item.name]) acc[item.name] = { name: item.name, value: 0, count: 0 };
+      acc[item.name].value += item.value;
+      acc[item.name].count += 1;
+      return acc;
+    }, {})
+  ).sort((a,b)=>b.value-a.value);
 
   const snapshotChartData = [...data.snapshots]
     .sort((a,b)=>new Date(a.date)-new Date(b.date))
@@ -550,7 +582,7 @@ export default function PortfolioTracker() {
                         <div key={item.name} style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"8px"}}>
                           <div style={{display:"flex",alignItems:"center",gap:"8px"}}>
                             <div style={{width:"7px",height:"7px",borderRadius:"50%",background:COLORS[i%COLORS.length],flexShrink:0}}/>
-                            <span style={{fontSize:"12px",color:"#C0B8A8"}}>{item.name}</span>
+                            <span style={{fontSize:"12px",color:"#C0B8A8"}}>{item.name}{item.count>1&&<span style={{color:"#5A6057",fontSize:"10px"}}> ×{item.count}</span>}</span>
                           </div>
                           <span style={{fontSize:"11px",color:"#7A8077"}}>{totalValue>0?((item.value/totalValue)*100).toFixed(1):0}%</span>
                         </div>
@@ -840,46 +872,176 @@ export default function PortfolioTracker() {
         )}
 
         {/* INCOME */}
-        {activeTab==="income"&&(
+        {activeTab==="income"&&(() => {
+          // Build a unified, filtered income list
+          const allIncome = [
+            ...data.dividends.map(d => {
+              const asset = data.assets.find(a => a.id === d.assetId);
+              return {...d, _type:"Dividend", _source: asset ? (asset.ticker||asset.name) : "Unassigned"};
+            }),
+            ...data.p2pInterest.map(p => {
+              const loan = data.p2pLoans.find(l => String(l.id)===String(p.loanId));
+              return {...p, _type:"P2P Interest", _source: p.platform || (loan ? loan.platform : "Unassigned")};
+            }),
+          ];
+
+          const sources = [...new Set(allIncome.map(i => i._source))].sort();
+
+          const filtered = allIncome.filter(i => {
+            if (incomeFilter==="dividend" && i._type!=="Dividend") return false;
+            if (incomeFilter==="p2p" && i._type!=="P2P Interest") return false;
+            if (incomeSource!=="all" && i._source!==incomeSource) return false;
+            return true;
+          });
+
+          const filteredTotal = filtered.reduce((s,i)=>s+Number(i.amount),0);
+
+          // Aggregate into periods
+          const grouped = incomePeriod==="none" ? null : Object.values(
+            filtered.reduce((acc,item)=>{
+              const {key,label} = periodKey(item.date, incomePeriod);
+              if (!acc[key]) acc[key] = {key,label,total:0,dividends:0,p2p:0,count:0};
+              acc[key].total += Number(item.amount);
+              acc[key].count += 1;
+              if (item._type==="Dividend") acc[key].dividends += Number(item.amount);
+              else acc[key].p2p += Number(item.amount);
+              return acc;
+            },{})
+          ).sort((a,b)=>a.key.localeCompare(b.key));
+
+          const chartData = grouped ? grouped.slice(-24) : [];
+          const avgPerPeriod = grouped && grouped.length>0 ? filteredTotal/grouped.length : 0;
+
+          const filterBtn = (active) => ({
+            background: active?"#1A2A1A":"none",
+            border:`1px solid ${active?"#2A3A2A":"#2A2D2B"}`,
+            borderRadius:"2px", color: active?"#7EC89B":"#5A6057",
+            fontSize:"10px", letterSpacing:"2px", padding:"7px 14px",
+            cursor:"pointer", textTransform:"uppercase", fontFamily:"Georgia, serif",
+          });
+
+          return (
           <div>
-            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:"24px"}}>
+            {/* Header */}
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:"20px"}}>
               <div>
-                <div style={{fontSize:"10px",letterSpacing:"3px",color:"#5A6057",textTransform:"uppercase",marginBottom:"4px"}}>Total Income</div>
-                <div style={{fontSize:"24px",color:"#C8A97E"}}>{formatCurrency(totalIncome)}</div>
-                <div style={{fontSize:"12px",color:"#5A6057",marginTop:"4px"}}>{formatCurrency(totalDividends)} dividends · {formatCurrency(totalP2PInterest)} P2P interest</div>
+                <div style={{fontSize:"10px",letterSpacing:"3px",color:"#5A6057",textTransform:"uppercase",marginBottom:"4px"}}>
+                  {incomeFilter==="all"?"Total Income":incomeFilter==="dividend"?"Dividend Income":"P2P Interest Income"}
+                  {incomeSource!=="all" && ` · ${incomeSource}`}
+                </div>
+                <div style={{fontSize:"28px",color:"#C8A97E",fontWeight:"300"}}>{formatCurrency(filteredTotal)}</div>
+                <div style={{fontSize:"12px",color:"#5A6057",marginTop:"4px"}}>
+                  {filtered.length} {filtered.length===1?"entry":"entries"}
+                  {grouped && grouped.length>0 && ` · ${formatCurrency(avgPerPeriod)} avg per ${incomePeriod}`}
+                </div>
               </div>
               <div style={{display:"flex",gap:"10px"}}>
                 <button onClick={()=>setShowAddInterest(true)} style={{background:"none",border:"1px solid #2A2D2B",borderRadius:"2px",color:"#7EC89B",fontSize:"10px",letterSpacing:"2px",padding:"8px 16px",cursor:"pointer",textTransform:"uppercase"}}>+ P2P Interest</button>
                 <button onClick={()=>setShowAddDividend(true)} style={primaryBtnStyle}>+ Dividend</button>
               </div>
             </div>
-            {(data.dividends.length===0&&data.p2pInterest.length===0)?<EmptyState>No income logged yet.</EmptyState>:(
-              <div style={{background:"#161918",border:"1px solid #2A2D2B",borderRadius:"4px",overflow:"hidden"}}>
-                <table style={{width:"100%",borderCollapse:"collapse"}}>
-                  <thead><tr style={{borderBottom:"1px solid #2A2D2B"}}>{["Date","Source","Type","Amount","Note"].map(h=><th key={h} style={thStyle}>{h}</th>)}</tr></thead>
-                  <tbody>
-                    {[...data.dividends.map(d=>({...d,_type:"Dividend"})),...data.p2pInterest.map(p=>({...p,_type:"P2P Interest"}))]
-                      .sort((a,b)=>new Date(b.date)-new Date(a.date))
-                      .map((item,i,arr)=>{
-                        let source=item.platform||"—";
-                        if(item._type==="Dividend"){const asset=data.assets.find(a=>a.id===item.assetId);source=asset?(asset.ticker||asset.name):"—";}
-                        else if(!item.platform){const loan=data.p2pLoans.find(l=>String(l.id)===String(item.loanId));source=loan?loan.platform:"—";}
-                        return(
+
+            {/* Filters */}
+            <div style={{background:"#161918",border:"1px solid #2A2D2B",borderRadius:"4px",padding:"16px 20px",marginBottom:"24px",display:"flex",flexWrap:"wrap",gap:"24px",alignItems:"center"}}>
+              <div style={{display:"flex",alignItems:"center",gap:"10px"}}>
+                <span style={{fontSize:"9px",letterSpacing:"2px",color:"#3A4038",textTransform:"uppercase"}}>Type</span>
+                <div style={{display:"flex",gap:"6px"}}>
+                  {[{v:"all",l:"All"},{v:"dividend",l:"Dividends"},{v:"p2p",l:"P2P Interest"}].map(f=>(
+                    <button key={f.v} onClick={()=>setIncomeFilter(f.v)} style={filterBtn(incomeFilter===f.v)}>{f.l}</button>
+                  ))}
+                </div>
+              </div>
+              <div style={{display:"flex",alignItems:"center",gap:"10px"}}>
+                <span style={{fontSize:"9px",letterSpacing:"2px",color:"#3A4038",textTransform:"uppercase"}}>Group by</span>
+                <div style={{display:"flex",gap:"6px"}}>
+                  {[{v:"day",l:"Day"},{v:"week",l:"Week"},{v:"month",l:"Month"},{v:"year",l:"Year"},{v:"none",l:"All entries"}].map(f=>(
+                    <button key={f.v} onClick={()=>setIncomePeriod(f.v)} style={filterBtn(incomePeriod===f.v)}>{f.l}</button>
+                  ))}
+                </div>
+              </div>
+              {sources.length>1&&(
+                <div style={{display:"flex",alignItems:"center",gap:"10px"}}>
+                  <span style={{fontSize:"9px",letterSpacing:"2px",color:"#3A4038",textTransform:"uppercase"}}>Source</span>
+                  <select value={incomeSource} onChange={e=>setIncomeSource(e.target.value)} style={{background:"#0D0F0E",border:"1px solid #2A2D2B",borderRadius:"2px",color:"#C0B8A8",fontSize:"11px",padding:"7px 10px",cursor:"pointer",fontFamily:"Georgia, serif",outline:"none"}}>
+                    <option value="all">All sources</option>
+                    {sources.map(s=><option key={s} value={s}>{s}</option>)}
+                  </select>
+                </div>
+              )}
+            </div>
+
+            {filtered.length===0 ? <EmptyState>No income matches these filters.</EmptyState> : (
+              <>
+                {/* Chart */}
+                {grouped && chartData.length>1 && (
+                  <div style={{background:"#161918",border:"1px solid #2A2D2B",borderRadius:"4px",padding:"24px",marginBottom:"24px"}}>
+                    <div style={{fontSize:"10px",letterSpacing:"3px",color:"#5A6057",textTransform:"uppercase",marginBottom:"16px"}}>Income per {incomePeriod}</div>
+                    <ResponsiveContainer width="100%" height={200}>
+                      <AreaChart data={chartData}>
+                        <defs>
+                          <linearGradient id="gInc" x1="0" y1="0" x2="0" y2="1"><stop offset="5%" stopColor="#C8A97E" stopOpacity={0.35}/><stop offset="95%" stopColor="#C8A97E" stopOpacity={0}/></linearGradient>
+                        </defs>
+                        <XAxis dataKey="label" tick={{fill:"#5A6057",fontSize:10}} axisLine={false} tickLine={false}/>
+                        <YAxis tick={{fill:"#5A6057",fontSize:10}} axisLine={false} tickLine={false} tickFormatter={v=>`€${v.toFixed(0)}`}/>
+                        <Tooltip contentStyle={{background:"#0D0F0E",border:"1px solid #2A2D2B",color:"#E8E0D0"}} formatter={v=>[formatCurrency(v)]}/>
+                        <Area type="monotone" dataKey="total" stroke="#C8A97E" strokeWidth={2} fill="url(#gInc)" name="Income"/>
+                      </AreaChart>
+                    </ResponsiveContainer>
+                  </div>
+                )}
+
+                {/* Aggregated table */}
+                {grouped ? (
+                  <div style={{background:"#161918",border:"1px solid #2A2D2B",borderRadius:"4px",overflow:"hidden"}}>
+                    <table style={{width:"100%",borderCollapse:"collapse"}}>
+                      <thead><tr style={{borderBottom:"1px solid #2A2D2B"}}>{["Period","Entries","Dividends","P2P Interest","Total"].map(h=><th key={h} style={thStyle}>{h}</th>)}</tr></thead>
+                      <tbody>
+                        {[...grouped].reverse().map((g,i,arr)=>(
+                          <tr key={g.key} style={{borderBottom:i<arr.length-1?"1px solid #1E2120":"none"}} onMouseEnter={e=>e.currentTarget.style.background="#1A1D1B"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
+                            <td style={{padding:"14px 16px",color:"#E8E0D0",fontSize:"13px"}}>{g.label}</td>
+                            <td style={{padding:"14px 16px",color:"#3A4038",fontSize:"12px"}}>{g.count}</td>
+                            <td style={{padding:"14px 16px",color:g.dividends>0?"#9B7EC8":"#3A4038",fontSize:"13px"}}>{g.dividends>0?formatCurrency(g.dividends):"—"}</td>
+                            <td style={{padding:"14px 16px",color:g.p2p>0?"#7EC89B":"#3A4038",fontSize:"13px"}}>{g.p2p>0?formatCurrency(g.p2p):"—"}</td>
+                            <td style={{padding:"14px 16px",color:"#C8A97E",fontSize:"15px",fontWeight:"500"}}>{formatCurrency(g.total)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                      <tfoot>
+                        <tr style={{borderTop:"1px solid #2A2D2B",background:"#1A1D1B"}}>
+                          <td style={{padding:"14px 16px",fontSize:"10px",letterSpacing:"2px",color:"#5A6057",textTransform:"uppercase"}}>Total</td>
+                          <td style={{padding:"14px 16px",color:"#3A4038",fontSize:"12px"}}>{filtered.length}</td>
+                          <td style={{padding:"14px 16px",color:"#9B7EC8",fontSize:"13px"}}>{formatCurrency(grouped.reduce((s,g)=>s+g.dividends,0))}</td>
+                          <td style={{padding:"14px 16px",color:"#7EC89B",fontSize:"13px"}}>{formatCurrency(grouped.reduce((s,g)=>s+g.p2p,0))}</td>
+                          <td style={{padding:"14px 16px",color:"#C8A97E",fontSize:"16px",fontWeight:"500"}}>{formatCurrency(filteredTotal)}</td>
+                        </tr>
+                      </tfoot>
+                    </table>
+                  </div>
+                ) : (
+                  /* Individual entries */
+                  <div style={{background:"#161918",border:"1px solid #2A2D2B",borderRadius:"4px",overflow:"hidden"}}>
+                    <table style={{width:"100%",borderCollapse:"collapse"}}>
+                      <thead><tr style={{borderBottom:"1px solid #2A2D2B"}}>{["Date","Source","Type","Amount","Note"].map(h=><th key={h} style={thStyle}>{h}</th>)}</tr></thead>
+                      <tbody>
+                        {[...filtered].sort((a,b)=>new Date(b.date)-new Date(a.date)).slice(0,200).map((item,i,arr)=>(
                           <tr key={item.id+item._type} style={{borderBottom:i<arr.length-1?"1px solid #1E2120":"none"}}>
                             <td style={tdStyle}>{item.date}</td>
-                            <td style={{padding:"14px 16px",color:"#C0B8A8",fontSize:"13px"}}>{source}{item.auto&&<span style={{fontSize:"9px",color:"#3A6A4A",marginLeft:"6px"}}>AUTO</span>}</td>
+                            <td style={{padding:"14px 16px",color:"#C0B8A8",fontSize:"13px"}}>{item._source}{item.auto&&<span style={{fontSize:"9px",color:"#3A6A4A",marginLeft:"6px"}}>AUTO</span>}</td>
                             <td style={{padding:"14px 16px"}}><span style={{fontSize:"10px",letterSpacing:"1px",padding:"3px 8px",borderRadius:"2px",background:item._type==="P2P Interest"?"#1A2A1A":"#1A1A2E",color:item._type==="P2P Interest"?"#7EC89B":"#9B7EC8",border:`1px solid ${item._type==="P2P Interest"?"#2A3A2A":"#2A2A3E"}`}}>{item._type}</span></td>
                             <td style={{padding:"14px 16px",color:"#C8A97E",fontSize:"14px"}}>{formatCurrency(item.amount)}</td>
                             <td style={{padding:"14px 16px",color:"#5A6057",fontSize:"12px"}}>{item.note||"—"}</td>
                           </tr>
-                        );
-                      })}
-                  </tbody>
-                </table>
-              </div>
+                        ))}
+                      </tbody>
+                    </table>
+                    {filtered.length>200&&<div style={{padding:"12px 16px",fontSize:"11px",color:"#3A4038",borderTop:"1px solid #1E2120"}}>Showing 200 most recent of {filtered.length} entries. Group by period to see all.</div>}
+                  </div>
+                )}
+              </>
             )}
           </div>
-        )}
+          );
+        })()}
       </div>
 
       {/* MODALS */}
