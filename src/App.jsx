@@ -95,8 +95,18 @@ const loanToRow   = l => [l.id, l.platform, l.loanId || "", l.amount, l.interest
 const rowToLoan   = r => ({ id: r[0], platform: r[1], loanId: r[2], amount: Number(r[3]), interestRate: Number(r[4]), startDate: r[5], endDate: r[6], note: r[7] });
 const intToRow    = i => [i.id, i.loanId || "", i.platform || "", i.amount, i.date, i.note || "", i.auto ? "1" : "0"];
 const rowToInt    = r => ({ id: r[0], loanId: r[1], platform: r[2], amount: Number(r[3]), date: r[4], note: r[5], auto: r[6] === "1" });
-const ruleToRow   = r => [r.id, r.platform, r.loanId || "", r.amountPerDay, r.startDate, r.lastRunDate || "", r.active ? "1" : "0"];
-const rowToRule   = r => ({ id: r[0], platform: r[1], loanId: r[2], amountPerDay: Number(r[3]), startDate: r[4], lastRunDate: r[5], active: r[6] === "1" });
+const ruleToRow   = r => [r.id, r.platform, r.loanId || "", r.amountPerDay, r.startDate, r.lastRunDate || "", r.active ? "1" : "0", r.mode || "fixed"];
+const rowToRule   = r => ({ id: r[0], platform: r[1], loanId: r[2], amountPerDay: Number(r[3]), startDate: r[4], lastRunDate: r[5], active: r[6] === "1", mode: r[7] || "fixed" });
+
+// Daily interest for a rule. Linked rules derive it from the loan; fixed rules use the stored amount.
+function dailyAmountForRule(rule, loans) {
+  if (rule.mode === "linked") {
+    const loan = loans.find(l => String(l.id) === String(rule.loanId));
+    if (!loan) return 0;
+    return (Number(loan.amount) * Number(loan.interestRate) / 100) / 365;
+  }
+  return Number(rule.amountPerDay) || 0;
+}
 const propToRow   = p => [p.id, p.name, p.currentValue, p.note || ""];
 const rowToProp   = r => ({ id: r[0], name: r[1], currentValue: Number(r[2]), note: r[3] });
 const commToRow   = c => [c.id, c.name, c.weight, c.unit, c.pricePerUnit, c.note || "", c.lastUpdated || ""];
@@ -235,7 +245,7 @@ export default function PortfolioTracker() {
   const [dividendForm,setDividendForm]=useState({assetId:"",amount:"",date:today(),note:""});
   const [p2pForm,setP2pForm]=useState({platform:"",loanId:"",amount:"",interestRate:"",startDate:today(),endDate:"",note:""});
   const [interestForm,setInterestForm]=useState({loanId:"",amount:"",date:today(),note:""});
-  const [ruleForm,setRuleForm]=useState({platform:"",loanId:"",amountPerDay:"",startDate:today()});
+  const [ruleForm,setRuleForm]=useState({platform:"",loanId:"",amountPerDay:"",startDate:today(),mode:"linked"});
   const [propertyForm,setPropertyForm]=useState({name:"",currentValue:"",note:""});
   const [commodityForm,setCommodityForm]=useState({name:"Gold",weight:"",unit:"oz",pricePerUnit:"",note:""});
   const [snapshotDate,setSnapshotDate]=useState(today());
@@ -294,7 +304,9 @@ export default function PortfolioTracker() {
         const from = rule.lastRunDate || rule.startDate;
         if (!from || from >= todayStr) return rule;
         const missed = datesBetween(from, todayStr);
-        missed.forEach(date => { newInterest.push({id:`auto-${rule.id}-${date}`,loanId:rule.loanId||"",platform:rule.platform,amount:Number(rule.amountPerDay),date,note:`Auto — ${rule.platform}`,auto:true}); autoAdded++; });
+        const daily = dailyAmountForRule(rule, loaded.p2pLoans);
+        if (daily <= 0) return rule;
+        missed.forEach(date => { newInterest.push({id:`auto-${rule.id}-${date}`,loanId:rule.loanId||"",platform:rule.platform,amount:Number(daily.toFixed(4)),date,note:`Auto — ${rule.platform}`,auto:true}); autoAdded++; });
         rulesChanged = true;
         return {...rule, lastRunDate: todayStr};
       });
@@ -409,8 +421,31 @@ export default function PortfolioTracker() {
   const handleEditP2P = async () => { if(!editingP2P)return; await updateData({p2pLoans:data.p2pLoans.map(l=>l.id===editingP2P.id?{...editingP2P,amount:Number(editingP2P.amount),interestRate:Number(editingP2P.interestRate)}:l)},TABS.P2P_LOANS,loanToRow);setEditingP2P(null); };
   const handleDeleteP2P = async (id) => { await updateData({p2pLoans:data.p2pLoans.filter(l=>l.id!==id)},TABS.P2P_LOANS,loanToRow); };
   const handleAddInterest = async () => { if(!interestForm.amount||!interestForm.date)return; await updateData({p2pInterest:[...data.p2pInterest,{id:String(Date.now()),...interestForm,amount:Number(interestForm.amount),auto:false}]},TABS.P2P_INTEREST,intToRow);setInterestForm({loanId:"",amount:"",date:today(),note:""});setShowAddInterest(false); };
-  const handleAddRule = async () => { if(!ruleForm.platform||!ruleForm.amountPerDay)return; await updateData({recurringRules:[...data.recurringRules,{id:String(Date.now()),...ruleForm,amountPerDay:Number(ruleForm.amountPerDay),lastRunDate:ruleForm.startDate,active:true}]},TABS.RECURRING,ruleToRow);setRuleForm({platform:"",loanId:"",amountPerDay:"",startDate:today()});setShowAddRule(false); };
-  const handleEditRule = async () => { if(!editingRule)return; await updateData({recurringRules:data.recurringRules.map(r=>r.id===editingRule.id?{...editingRule,amountPerDay:Number(editingRule.amountPerDay)}:r)},TABS.RECURRING,ruleToRow);setEditingRule(null); };
+  const handleAddRule = async () => {
+    const isLinked = ruleForm.mode === "linked";
+    if (isLinked ? !ruleForm.loanId : (!ruleForm.platform || !ruleForm.amountPerDay)) return;
+    const linkedLoan = isLinked ? data.p2pLoans.find(l => String(l.id) === String(ruleForm.loanId)) : null;
+    const rule = {
+      id: String(Date.now()),
+      platform: isLinked ? (linkedLoan?.platform || "") : ruleForm.platform,
+      loanId: ruleForm.loanId,
+      amountPerDay: isLinked ? 0 : Number(ruleForm.amountPerDay),
+      startDate: ruleForm.startDate,
+      lastRunDate: ruleForm.startDate,
+      active: true,
+      mode: ruleForm.mode,
+    };
+    await updateData({recurringRules:[...data.recurringRules, rule]},TABS.RECURRING,ruleToRow);
+    setRuleForm({platform:"",loanId:"",amountPerDay:"",startDate:today(),mode:"linked"});
+    setShowAddRule(false);
+  };
+  const handleEditRule = async () => {
+    if(!editingRule)return;
+    const linkedLoan = editingRule.mode==="linked" ? data.p2pLoans.find(l=>String(l.id)===String(editingRule.loanId)) : null;
+    const updated = {...editingRule, amountPerDay:Number(editingRule.amountPerDay)||0, platform: linkedLoan ? linkedLoan.platform : editingRule.platform};
+    await updateData({recurringRules:data.recurringRules.map(r=>r.id===editingRule.id?updated:r)},TABS.RECURRING,ruleToRow);
+    setEditingRule(null);
+  };
   const handleToggleRule = async (id) => { await updateData({recurringRules:data.recurringRules.map(r=>r.id===id?{...r,active:!r.active}:r)},TABS.RECURRING,ruleToRow); };
   const handleDeleteRule = async (id) => { await updateData({recurringRules:data.recurringRules.filter(r=>r.id!==id)},TABS.RECURRING,ruleToRow); };
   const handleAddProperty = async () => { if(!propertyForm.name||!propertyForm.currentValue)return; await updateData({realEstate:[...data.realEstate,{id:String(Date.now()),...propertyForm,currentValue:Number(propertyForm.currentValue)}]},TABS.REAL_ESTATE,propToRow);setPropertyForm({name:"",currentValue:"",note:""});setShowAddProperty(false); };
@@ -713,24 +748,38 @@ export default function PortfolioTracker() {
             {data.recurringRules.filter(r=>r.active).length>0&&(
               <div style={{background:"#1A2A1A",border:"1px solid #2A3A2A",borderRadius:"4px",padding:"16px 24px",marginTop:"16px",marginBottom:"24px",display:"flex",alignItems:"center",gap:"16px"}}>
                 <span style={{fontSize:"10px",letterSpacing:"3px",color:"#4A8A5A",textTransform:"uppercase"}}>Daily Auto-Total</span>
-                <span style={{fontSize:"22px",color:"#7EC89B",fontWeight:"300"}}>{formatCurrency(data.recurringRules.filter(r=>r.active).reduce((s,r)=>s+Number(r.amountPerDay),0))}<span style={{fontSize:"12px",color:"#4A7A5A",marginLeft:"6px"}}>/day</span></span>
+                <span style={{fontSize:"22px",color:"#7EC89B",fontWeight:"300"}}>{formatCurrency(data.recurringRules.filter(r=>r.active).reduce((s,r)=>s+dailyAmountForRule(r,data.p2pLoans),0))}<span style={{fontSize:"12px",color:"#4A7A5A",marginLeft:"6px"}}>/day</span></span>
               </div>
             )}
             {data.recurringRules.length===0?<EmptyState>No recurring rules yet.</EmptyState>:(
               <div style={{background:"#161918",border:"1px solid #2A2D2B",borderRadius:"4px",overflow:"hidden"}}>
                 <table style={{width:"100%",borderCollapse:"collapse"}}>
-                  <thead><tr style={{borderBottom:"1px solid #2A2D2B"}}>{["Platform","Daily Amount","Started","Last Run","Status",""].map(h=><th key={h} style={thStyle}>{h}</th>)}</tr></thead>
+                  <thead><tr style={{borderBottom:"1px solid #2A2D2B"}}>{["Platform / Source","Daily Amount","Started","Last Run","Status",""].map(h=><th key={h} style={thStyle}>{h}</th>)}</tr></thead>
                   <tbody>
-                    {data.recurringRules.map((r,i)=>(
+                    {data.recurringRules.map((r,i)=>{
+                      const linkedLoan = r.mode==="linked" ? data.p2pLoans.find(l=>String(l.id)===String(r.loanId)) : null;
+                      const daily = dailyAmountForRule(r, data.p2pLoans);
+                      return(
                       <tr key={r.id} style={{borderBottom:i<data.recurringRules.length-1?"1px solid #1E2120":"none"}} onMouseEnter={e=>e.currentTarget.style.background="#1A1D1B"} onMouseLeave={e=>e.currentTarget.style.background="transparent"}>
-                        <td style={{padding:"14px 16px"}}><div style={{fontSize:"14px",color:"#E8E0D0"}}>{r.platform}</div>{r.loanId&&<div style={{fontSize:"11px",color:"#5A6057"}}>{r.loanId}</div>}</td>
-                        <td style={{padding:"14px 16px"}}><span style={{color:"#7EC89B",fontSize:"16px",fontWeight:"300"}}>{formatCurrency(r.amountPerDay)}</span><span style={{color:"#4A7A5A",fontSize:"11px"}}> /day</span></td>
+                        <td style={{padding:"14px 16px"}}>
+                          <div style={{fontSize:"14px",color:"#E8E0D0"}}>{r.platform}</div>
+                          {r.mode==="linked"
+                            ? (linkedLoan
+                                ? <div style={{fontSize:"11px",color:"#5A6057"}}>{linkedLoan.loanId||"Loan"} · {formatCurrency(linkedLoan.amount)} @ {linkedLoan.interestRate}%</div>
+                                : <div style={{fontSize:"11px",color:"#C87E7E"}}>⚠ Linked loan not found</div>)
+                            : (r.loanId&&<div style={{fontSize:"11px",color:"#5A6057"}}>{r.loanId}</div>)}
+                        </td>
+                        <td style={{padding:"14px 16px"}}>
+                          <span style={{color:"#7EC89B",fontSize:"16px",fontWeight:"300"}}>{formatCurrency(daily)}</span><span style={{color:"#4A7A5A",fontSize:"11px"}}> /day</span>
+                          <div style={{fontSize:"9px",letterSpacing:"1px",color:r.mode==="linked"?"#7EB5C8":"#5A6057",marginTop:"2px"}}>{r.mode==="linked"?"AUTO-CALCULATED":"FIXED"}</div>
+                        </td>
                         <td style={tdStyle}>{r.startDate}</td>
                         <td style={tdStyle}>{r.lastRunDate||"—"}</td>
                         <td style={{padding:"14px 16px"}}><button onClick={()=>handleToggleRule(r.id)} style={{fontSize:"10px",letterSpacing:"1px",padding:"4px 10px",borderRadius:"2px",cursor:"pointer",background:r.active?"#1A2A1A":"#1E1E1E",color:r.active?"#7EC89B":"#5A6057",border:`1px solid ${r.active?"#2A3A2A":"#2A2D2B"}`}}>{r.active?"● Active":"○ Paused"}</button></td>
                         <td style={{padding:"14px 16px"}}><div style={{display:"flex",gap:"8px"}}><button onClick={()=>setEditingRule({...r})} style={smallBtnStyle("#C8A97E")}>Edit</button><button onClick={()=>handleDeleteRule(r.id)} style={smallBtnStyle("#C87E7E")}>✕</button></div></td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -901,12 +950,84 @@ export default function PortfolioTracker() {
       )}
       {(showAddRule||editingRule)&&(
         <Modal title={editingRule?"Edit Rule":"Add Daily Interest Rule"} onClose={()=>{setShowAddRule(false);setEditingRule(null);}}>
-          <p style={{color:"#7A8077",fontSize:"13px",marginBottom:"20px",lineHeight:"1.6"}}>Set a fixed daily amount. Missed days backfill automatically on open.</p>
-          {[{f:"platform",l:"Platform Name",t:"text"},{f:"loanId",l:"Loan / Account ID (optional)",t:"text"},{f:"amountPerDay",l:"Daily Interest (€)",t:"number"},{f:"startDate",l:"Start Date",t:"date"}].map(({f,l,t})=>(
-            <div key={f} style={{marginBottom:"16px"}}><label style={labelStyle}>{l}</label><input type={t} style={inputStyle} placeholder={f==="amountPerDay"?"e.g. 1.50":""} value={editingRule?(editingRule[f]||""):ruleForm[f]} onChange={e=>editingRule?setEditingRule({...editingRule,[f]:e.target.value}):setRuleForm({...ruleForm,[f]:e.target.value})}/></div>
-          ))}
-          {editingRule&&<div style={{marginBottom:"20px"}}><label style={labelStyle}>Last Run Date</label><input type="date" style={inputStyle} value={editingRule.lastRunDate||""} onChange={e=>setEditingRule({...editingRule,lastRunDate:e.target.value})}/></div>}
-          <button onClick={editingRule?handleEditRule:handleAddRule} style={btnStyle}>{editingRule?"Save Changes":"Add Rule"}</button>
+          {(() => {
+            const form = editingRule || ruleForm;
+            const setForm = editingRule ? (patch)=>setEditingRule({...editingRule,...patch}) : (patch)=>setRuleForm({...ruleForm,...patch});
+            const isLinked = form.mode === "linked";
+            const linkedLoan = data.p2pLoans.find(l => String(l.id) === String(form.loanId));
+            const computed = linkedLoan ? (Number(linkedLoan.amount)*Number(linkedLoan.interestRate)/100)/365 : 0;
+            return (
+              <>
+                {/* Mode toggle */}
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:"8px",marginBottom:"20px"}}>
+                  {[{v:"linked",l:"Linked to loan",d:"Auto-calculated"},{v:"fixed",l:"Fixed amount",d:"You enter it"}].map(m=>(
+                    <button key={m.v} onClick={()=>setForm({mode:m.v})} style={{
+                      background:form.mode===m.v?"#1A2A1A":"#0D0F0E",
+                      border:`1px solid ${form.mode===m.v?"#2A3A2A":"#2A2D2B"}`,
+                      borderRadius:"2px",padding:"12px",cursor:"pointer",fontFamily:"Georgia, serif",textAlign:"left"}}>
+                      <div style={{fontSize:"12px",color:form.mode===m.v?"#7EC89B":"#7A8077"}}>{m.l}</div>
+                      <div style={{fontSize:"10px",color:"#5A6057",marginTop:"2px"}}>{m.d}</div>
+                    </button>
+                  ))}
+                </div>
+
+                {isLinked ? (
+                  <>
+                    <div style={{marginBottom:"16px"}}>
+                      <label style={labelStyle}>P2P Loan / Vault</label>
+                      <select style={{...inputStyle,cursor:"pointer"}} value={form.loanId||""} onChange={e=>setForm({loanId:e.target.value})}>
+                        <option value="">— Select a loan</option>
+                        {data.p2pLoans.map(l=><option key={l.id} value={l.id}>{l.platform}{l.loanId?` · ${l.loanId}`:""} — {formatCurrency(l.amount)} @ {l.interestRate}%</option>)}
+                      </select>
+                    </div>
+                    {linkedLoan && (
+                      <div style={{background:"#1A2A1A",border:"1px solid #2A3A2A",borderRadius:"4px",padding:"16px",marginBottom:"16px"}}>
+                        <div style={{fontSize:"10px",letterSpacing:"2px",color:"#4A8A5A",textTransform:"uppercase",marginBottom:"10px"}}>Calculated Daily Interest</div>
+                        <div style={{fontSize:"24px",color:"#7EC89B",fontWeight:"300",marginBottom:"8px"}}>{formatCurrency(computed)}<span style={{fontSize:"12px",color:"#4A7A5A",marginLeft:"6px"}}>/day</span></div>
+                        <div style={{fontSize:"11px",color:"#4A7A5A",lineHeight:"1.6"}}>
+                          {formatCurrency(linkedLoan.amount)} × {linkedLoan.interestRate}% ÷ 365<br/>
+                          ≈ {formatCurrency(computed*30.4)} per month · {formatCurrency(computed*365)} per year
+                        </div>
+                        <div style={{fontSize:"11px",color:"#3A6A4A",marginTop:"10px",paddingTop:"10px",borderTop:"1px solid #2A3A2A"}}>
+                          Updates automatically if you change the loan amount or rate.
+                        </div>
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  <>
+                    <div style={{marginBottom:"16px"}}>
+                      <label style={labelStyle}>Platform Name</label>
+                      <input type="text" style={inputStyle} value={form.platform||""} onChange={e=>setForm({platform:e.target.value})} placeholder="e.g. Nexo"/>
+                    </div>
+                    <div style={{marginBottom:"16px"}}>
+                      <label style={labelStyle}>Loan / Account ID (optional)</label>
+                      <input type="text" style={inputStyle} value={form.loanId||""} onChange={e=>setForm({loanId:e.target.value})}/>
+                    </div>
+                    <div style={{marginBottom:"16px"}}>
+                      <label style={labelStyle}>Daily Interest (€)</label>
+                      <input type="number" style={inputStyle} value={form.amountPerDay||""} onChange={e=>setForm({amountPerDay:e.target.value})} placeholder="e.g. 1.35"/>
+                    </div>
+                  </>
+                )}
+
+                <div style={{marginBottom:"16px"}}>
+                  <label style={labelStyle}>Start Date (first day to accrue from)</label>
+                  <input type="date" style={inputStyle} value={form.startDate||""} onChange={e=>setForm({startDate:e.target.value})}/>
+                </div>
+
+                {editingRule&&(
+                  <div style={{marginBottom:"20px"}}>
+                    <label style={labelStyle}>Last Run Date</label>
+                    <input type="date" style={inputStyle} value={editingRule.lastRunDate||""} onChange={e=>setEditingRule({...editingRule,lastRunDate:e.target.value})}/>
+                    <div style={{fontSize:"11px",color:"#5A6057",marginTop:"6px"}}>Set earlier to re-backfill missed days.</div>
+                  </div>
+                )}
+
+                <button onClick={editingRule?handleEditRule:handleAddRule} style={btnStyle}>{editingRule?"Save Changes":"Add Rule"}</button>
+              </>
+            );
+          })()}
         </Modal>
       )}
       {showSnapshot&&(
